@@ -236,7 +236,14 @@ final class WakefulRunner {
         var buffer = [UInt8](repeating: 0, count: 8192)
         let bytesRead = read(source, &buffer, buffer.count)
         if bytesRead > 0 {
-            _ = write(destination, buffer, bytesRead)
+            var totalWritten = 0
+            buffer.withUnsafeBytes { bufferPtr in
+                while totalWritten < bytesRead {
+                    let written = write(destination, bufferPtr.baseAddress! + totalWritten, bytesRead - totalWritten)
+                    if written <= 0 { break }
+                    totalWritten += written
+                }
+            }
         }
     }
     
