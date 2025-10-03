@@ -208,8 +208,26 @@ final class WakefulRunner {
         }
         masterSource?.resume()
         
+        // Wait for child with EINTR handling
         var status: Int32 = 0
-        waitpid(childPID, &status, 0)
+        while waitpid(childPID, &status, 0) == -1 && errno == EINTR {}
+        
+        // Cancel dispatch sources to stop reading
+        stdinSource?.cancel()
+        masterSource?.cancel()
+        
+        // Give dispatch sources a moment to process any pending events
+        usleep(50_000) // 50ms
+        
+        // Drain any remaining bytes from the PTY master
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        var bytesRead: Int
+        repeat {
+            bytesRead = read(master, &buffer, buffer.count)
+            if bytesRead > 0 {
+                _ = write(STDOUT_FILENO, buffer, bytesRead)
+            }
+        } while bytesRead > 0
         
         return ProcessStatus(status: status).exitCode
     }
@@ -269,9 +287,12 @@ final class WakefulRunner {
             exit(130)
         }
         
-        // Use waitpid instead of kill(pid, 0)
+        // Use waitpid with EINTR handling
         var status: Int32 = 0
-        let result = waitpid(childPID, &status, WNOHANG)
+        var result: Int32
+        repeat {
+            result = waitpid(childPID, &status, WNOHANG)
+        } while result == -1 && errno == EINTR
         
         if result != 0 {  // Process has exited (result > 0) or error (result < 0)
             cleanup()
@@ -376,14 +397,22 @@ final class WakefulRunner {
     private func waitForChildTermination(semaphore: DispatchSemaphore) {
         let startTime = Date()
         var status: Int32 = 0
+        var result: Int32
         
-        // Use waitpid with WNOHANG instead of kill(pid, 0)
-        while waitpid(childPID, &status, WNOHANG) == 0 && Date().timeIntervalSince(startTime) < sleepGracePeriod {
+        // Use waitpid with WNOHANG and EINTR handling
+        repeat {
+            result = waitpid(childPID, &status, WNOHANG)
+        } while result == -1 && errno == EINTR
+        
+        while result == 0 && Date().timeIntervalSince(startTime) < sleepGracePeriod {
             usleep(100_000)
+            repeat {
+                result = waitpid(childPID, &status, WNOHANG)
+            } while result == -1 && errno == EINTR
         }
         
         // Check if process is still running (waitpid returns 0 if still alive)
-        if waitpid(childPID, &status, WNOHANG) == 0 {
+        if result == 0 {
             if verbose {
                 print("\rChild process still running after grace period, sending termination signal (SIGTERM)…\r\n", terminator: "")
             }
@@ -391,8 +420,15 @@ final class WakefulRunner {
             kill(-childPID, SIGTERM)
             
             let terminateStart = Date()
-            while waitpid(childPID, &status, WNOHANG) == 0 && Date().timeIntervalSince(terminateStart) < 2.0 {
+            repeat {
+                result = waitpid(childPID, &status, WNOHANG)
+            } while result == -1 && errno == EINTR
+            
+            while result == 0 && Date().timeIntervalSince(terminateStart) < 2.0 {
                 usleep(100_000)
+                repeat {
+                    result = waitpid(childPID, &status, WNOHANG)
+                } while result == -1 && errno == EINTR
             }
         }
         
