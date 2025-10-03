@@ -239,7 +239,7 @@ final class WakefulRunner {
         }
         
         var pid: pid_t = 0
-        let result = posix_spawn(&pid, command, &fileActions, &spawnAttrs, cArgs, environ)
+        let result = posix_spawnp(&pid, command, &fileActions, &spawnAttrs, cArgs, environ)
         
         guard result == 0 else {
             throw WakefulError.spawnFailed(command, result)
@@ -575,36 +575,6 @@ func printUsage() {
     """, to: &StandardError.shared)
 }
 
-func resolveCommand(_ command: String) -> String {
-    guard !command.hasPrefix("/"), !command.hasPrefix(".") else {
-        return command
-    }
-    
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-    process.arguments = [command]
-    
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
-    
-    do {
-        try process.run()
-        process.waitUntilExit()
-        
-        if process.terminationStatus == 0,
-           let data = try? pipe.fileHandleForReading.readToEnd(),
-           let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !path.isEmpty {
-            return path
-        }
-    } catch {
-        // Fall through to return original command
-    }
-    
-    return command
-}
-
 // MARK: - Standard Error Output
 
 struct StandardError: TextOutputStream {
@@ -621,8 +591,6 @@ guard let options = parseCommandLine(), let command = options.command else {
     exit(1)
 }
 
-let executablePath = resolveCommand(command)
-
 let runner = WakefulRunner(
     preventDisplaySleep: options.preventDisplaySleep,
     sleepGracePeriod: options.sleepGracePeriod,
@@ -633,7 +601,7 @@ var exitCode: Int32 = 1
 
 DispatchQueue.global().async {
     do {
-        exitCode = try runner.run(command: executablePath, arguments: options.arguments)
+        exitCode = try runner.run(command: command, arguments: options.arguments)
         exit(exitCode)
     } catch {
         print("Error: \(error.localizedDescription)", to: &StandardError.shared)
