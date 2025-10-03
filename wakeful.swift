@@ -531,18 +531,18 @@ func parseCommandLine() -> CommandLineOptions? {
             
         case "-h", "--help":
             printUsage()
-            return nil
+            exit(0)
             
         default:
             print("Error: Unknown option '\(arg)'", to: &StandardError.shared)
             printUsage()
-            return nil
+            exit(1)
         }
     }
     
     guard let command = args.first else {
         printUsage()
-        return nil
+        exit(1)
     }
     
     options.command = command
