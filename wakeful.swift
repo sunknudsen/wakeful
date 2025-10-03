@@ -132,50 +132,45 @@ final class WakefulRunner {
     // MARK: Private Methods - PTY
     
     private func spawnWithPTY(command: String, arguments: [String]) throws -> Int32 {
-        let (master, slave) = try openPTY()
-        defer { close(slave) }
+        var master: Int32 = -1
+        var windowSize = winsize()
         
+        // Get current terminal size if running in a terminal
+        if isatty(STDIN_FILENO) != 0 {
+            _ = ioctl(STDIN_FILENO, UInt(TIOCGWINSZ), &windowSize)
+        }
+        
+        // Use forkpty - it handles openpty, fork, setsid, and TIOCSCTTY for us
+        let pid = forkpty(&master, nil, nil, &windowSize)
+        
+        if pid == -1 {
+            throw WakefulError.ptyFailed("Failed to fork with PTY: \(String(cString: strerror(errno)))")
+        }
+        
+        if pid == 0 {
+            // Child process - already has controlling terminal set up by forkpty
+            
+            // Reset signal mask
+            var sigset = sigset_t()
+            sigemptyset(&sigset)
+            sigprocmask(SIG_SETMASK, &sigset, nil)
+            
+            // Execute the command
+            let args = [command] + arguments
+            let cArgs = args.map { strdup($0) } + [nil]
+            execvp(command, cArgs)
+            
+            // If execvp returns, it failed
+            Darwin._exit(127)
+        }
+        
+        // Parent process
+        self.childPID = pid
         self.masterFD = master
         
         try configureTerminal()
-        try spawnProcess(command: command, arguments: arguments, master: master, slave: slave)
-        
         setupSignalHandling()
         return try forwardIO(master: master)
-    }
-    
-    private func openPTY() throws -> (master: Int32, slave: Int32) {
-        let master = posix_openpt(O_RDWR | O_NOCTTY)
-        guard master != -1 else {
-            throw WakefulError.ptyFailed("Failed to open PTY master")
-        }
-        
-        guard grantpt(master) == 0, unlockpt(master) == 0 else {
-            close(master)
-            throw WakefulError.ptyFailed("Failed to grant/unlock PTY")
-        }
-        
-        var slaveName = [CChar](repeating: 0, count: 1024)
-        guard ptsname_r(master, &slaveName, slaveName.count) == 0 else {
-            close(master)
-            throw WakefulError.ptyFailed("Failed to get PTY slave name")
-        }
-        
-        let slave = open(String(cString: slaveName), O_RDWR)
-        guard slave != -1 else {
-            close(master)
-            throw WakefulError.ptyFailed("Failed to open PTY slave")
-        }
-        
-        // Set the PTY window size to match the parent terminal
-        if isatty(STDIN_FILENO) != 0 {
-            var windowSize = winsize()
-            if ioctl(STDIN_FILENO, UInt(TIOCGWINSZ), &windowSize) == 0 {
-                _ = ioctl(slave, UInt(TIOCSWINSZ), &windowSize)
-            }
-        }
-        
-        return (master, slave)
     }
     
     private func configureTerminal() throws {
@@ -193,51 +188,6 @@ final class WakefulRunner {
         // Disable echo to prevent ^C from being displayed
         raw.c_lflag &= ~tcflag_t(ECHO)
         tcsetattr(STDIN_FILENO, TCSANOW, &raw)
-    }
-    
-    private func spawnProcess(command: String, arguments: [String], master: Int32, slave: Int32) throws {
-        var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
-        defer { posix_spawn_file_actions_destroy(&fileActions) }
-        
-        posix_spawn_file_actions_adddup2(&fileActions, slave, STDIN_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slave, STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slave, STDERR_FILENO)
-        posix_spawn_file_actions_addclose(&fileActions, slave)
-        posix_spawn_file_actions_addclose(&fileActions, master)
-        
-        var spawnAttrs: posix_spawnattr_t?
-        posix_spawnattr_init(&spawnAttrs)
-        defer { posix_spawnattr_destroy(&spawnAttrs) }
-        
-        var flags: Int16 = 0
-        posix_spawnattr_getflags(&spawnAttrs, &flags)
-        flags |= Int16(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID)
-        posix_spawnattr_setflags(&spawnAttrs, flags)
-        
-        // Reset signal mask for child to allow SIGWINCH
-        var sigset = sigset_t()
-        sigemptyset(&sigset)
-        posix_spawnattr_setsigmask(&spawnAttrs, &sigset)
-        
-        // Set signals to default handling
-        sigfillset(&sigset)
-        posix_spawnattr_setsigdefault(&spawnAttrs, &sigset)
-        
-        let args = [command] + arguments
-        let cArgs = args.map { strdup($0) } + [nil]
-        defer {
-            cArgs.forEach { free($0) }
-        }
-        
-        var pid: pid_t = 0
-        let result = posix_spawnp(&pid, command, &fileActions, &spawnAttrs, cArgs, environ)
-        
-        guard result == 0 else {
-            throw WakefulError.spawnFailed(command, result)
-        }
-        
-        self.childPID = pid
     }
     
     private func forwardIO(master: Int32) throws -> Int32 {
