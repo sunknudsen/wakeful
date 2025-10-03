@@ -13,15 +13,12 @@ private let kIOMessageSystemHasPoweredOn = UInt32(0xE0000300)
 private enum ProcessStatus {
     case exited(code: Int32)
     case signaled(signal: Int32)
-    case unknown
     
     init(status: Int32) {
         if (status & 0x7f) == 0 {
             self = .exited(code: (status >> 8) & 0xff)
-        } else if (status & 0x7f) != 0 && (status & 0x7f) != 0x7f {
-            self = .signaled(signal: status & 0x7f)
         } else {
-            self = .unknown
+            self = .signaled(signal: status & 0x7f)
         }
     }
     
@@ -31,8 +28,6 @@ private enum ProcessStatus {
             return code
         case .signaled(let signal):
             return 128 + signal
-        case .unknown:
-            return 1
         }
     }
 }
@@ -43,7 +38,6 @@ enum WakefulError: LocalizedError {
     case assertionFailed(String)
     case ptyFailed(String)
     case spawnFailed(String, Int32)
-    case commandNotFound(String)
     
     var errorDescription: String? {
         switch self {
@@ -53,8 +47,6 @@ enum WakefulError: LocalizedError {
             return "PTY error: \(reason)"
         case .spawnFailed(let command, let error):
             return "Failed to spawn '\(command)': \(String(cString: strerror(error)))"
-        case .commandNotFound(let command):
-            return "Command not found: \(command)"
         }
     }
 }
@@ -412,7 +404,7 @@ final class WakefulRunner {
             IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
         }
         
-        guard childPID > 0, kill(childPID, 0) == 0 else {
+        guard childPID > 0 else {
             return
         }
         
