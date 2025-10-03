@@ -327,10 +327,11 @@ final class WakefulRunner {
             exit(130)
         }
         
-        // Check if child is still alive
-        let isAlive = kill(childPID, 0) == 0
+        // Use waitpid instead of kill(pid, 0)
+        var status: Int32 = 0
+        let result = waitpid(childPID, &status, WNOHANG)
         
-        if !isAlive {
+        if result != 0 {  // Process has exited (result > 0) or error (result < 0)
             cleanup()
             exit(130)
         }
@@ -432,21 +433,23 @@ final class WakefulRunner {
     
     private func waitForChildTermination(semaphore: DispatchSemaphore) {
         let startTime = Date()
+        var status: Int32 = 0
         
-        while kill(childPID, 0) == 0 && Date().timeIntervalSince(startTime) < sleepGracePeriod {
+        // Use waitpid with WNOHANG instead of kill(pid, 0)
+        while waitpid(childPID, &status, WNOHANG) == 0 && Date().timeIntervalSince(startTime) < sleepGracePeriod {
             usleep(100_000)
         }
         
-        if kill(childPID, 0) == 0 {
+        // Check if process is still running (waitpid returns 0 if still alive)
+        if waitpid(childPID, &status, WNOHANG) == 0 {
             if verbose {
                 print("\rChild process still running after grace period, sending termination signal (SIGTERM)…\r\n", terminator: "")
             }
             
-            // Send to process group
             kill(-childPID, SIGTERM)
             
             let terminateStart = Date()
-            while kill(childPID, 0) == 0 && Date().timeIntervalSince(terminateStart) < 2.0 {
+            while waitpid(childPID, &status, WNOHANG) == 0 && Date().timeIntervalSince(terminateStart) < 2.0 {
                 usleep(100_000)
             }
         }
