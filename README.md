@@ -3,7 +3,9 @@
 ## Compile and test command-line utility
 
 ```console
-$ swiftc -o wakeful wakeful.swift -framework Foundation -framework IOKit -framework AppKit
+$ swift build
 
-$ ./wakeful ./test.sh
+$ .build/debug/wakeful ./test.sh
+
+$ .build/debug/wakeful watch ls -la
 ```

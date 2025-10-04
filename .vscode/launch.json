@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:wakeful}",
+      "name": "Debug wakeful",
+      "program": "${workspaceFolder:wakeful}/.build/debug/wakeful",
+      "preLaunchTask": "swift: Build Debug wakeful"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:wakeful}",
+      "name": "Release wakeful",
+      "program": "${workspaceFolder:wakeful}/.build/release/wakeful",
+      "preLaunchTask": "swift: Build Release wakeful"
+    }
+  ]
+}

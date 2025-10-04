@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "swift-build",
+      "type": "shell",
+      "command": "swiftc",
+      "args": [
+        "-o",
+        "wakeful",
+        "wakeful.swift",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "IOKit",
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$swiftc"]
+    }
+  ]
+}
