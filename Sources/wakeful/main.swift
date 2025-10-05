@@ -175,11 +175,8 @@ final class WakefulRunner: @unchecked Sendable {
     }
     
     private func handleSystemWillSleep(messageArgument: UnsafeMutableRawPointer?) {
-        defer {
-            IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
-        }
-        
         guard childPID > 0 else {
+            IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
             return
         }
         
@@ -195,6 +192,15 @@ final class WakefulRunner: @unchecked Sendable {
         }
         
         _ = semaphore.wait(timeout: .now() + sleepGracePeriod + 2.0)
+        
+        if verbose {
+            print("\rChild process terminated, allowing sleep…\r\n", terminator: "")
+        }
+        
+        // Release power assertions before allowing sleep
+        releasePowerAssertions()
+        
+        IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
     }
     
     private func waitForChildTermination(semaphore: DispatchSemaphore) {
@@ -231,10 +237,6 @@ final class WakefulRunner: @unchecked Sendable {
                     result = waitpid(childPID, &status, WNOHANG)
                 } while result == -1 && errno == EINTR
             }
-        }
-        
-        if verbose {
-            print("\rChild process terminated, allowing sleep…\r\n", terminator: "")
         }
         
         semaphore.signal()
@@ -391,37 +393,74 @@ final class WakefulRunner: @unchecked Sendable {
     
     private func forwardIO() throws -> Int32 {
         let flags = fcntl(masterFD, F_GETFL, 0)
-        _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
+        guard flags != -1 else {
+            throw WakefulError.ptyFailed("Failed to get PTY flags: \(String(cString: strerror(errno)))")
+        }
+        
+        guard fcntl(masterFD, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw WakefulError.ptyFailed("Failed to set PTY to non-blocking: \(String(cString: strerror(errno)))")
+        }
         
         if isatty(STDIN_FILENO) != 0 {
             stdinSource = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: .global())
             stdinSource?.setEventHandler { [weak self] in
-                self?.forwardData(from: STDIN_FILENO, to: self?.masterFD ?? -1)
+                guard let self = self, self.masterFD >= 0 else { return }
+                self.forwardData(from: STDIN_FILENO, to: self.masterFD)
             }
             stdinSource?.resume()
         }
         
         masterSource = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
         masterSource?.setEventHandler { [weak self] in
-            self?.forwardData(from: self?.masterFD ?? -1, to: STDOUT_FILENO)
+            guard let self = self, self.masterFD >= 0 else { return }
+            self.forwardData(from: self.masterFD, to: STDOUT_FILENO)
         }
         masterSource?.resume()
         
-        var status: Int32 = 0
-        while waitpid(childPID, &status, 0) == -1 && errno == EINTR {}
+        // Block SIGCHLD so we can handle it with a dispatch source
+        var sigset = sigset_t()
+        sigemptyset(&sigset)
+        sigaddset(&sigset, SIGCHLD)
+        sigprocmask(SIG_BLOCK, &sigset, nil)
+        
+        // Set up SIGCHLD handler to detect child termination
+        var finalStatus: Int32 = 0
+        let childSource = DispatchSource.makeSignalSource(signal: SIGCHLD, queue: .main)
+        
+        childSource.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            var status: Int32 = 0
+            let result = waitpid(self.childPID, &status, WNOHANG)
+            if result > 0 {
+                finalStatus = status
+                childSource.cancel()
+                CFRunLoopStop(CFRunLoopGetMain())
+            }
+        }
+        childSource.resume()
+        
+        // Run the main run loop - it will process both:
+        // 1. Power notifications (from IOKit)
+        // 2. SIGCHLD (from dispatch source above)
+        CFRunLoopRun()
         
         stdinSource?.cancel()
         masterSource?.cancel()
         
-        // Allow remaining PTY data to drain
-        usleep(50_000)
+        // Unblock SIGCHLD after handling
+        sigemptyset(&sigset)
+        sigprocmask(SIG_UNBLOCK, &sigset, nil)
         
+        // Allow remaining PTY data to drain
+        usleep(100_000)
         drainRemainingPTYData()
         
-        return ProcessStatus(status: status).exitCode
+        return ProcessStatus(status: finalStatus).exitCode
     }
     
     private func forwardData(from source: FileDescriptor, to destination: FileDescriptor) {
+        guard source >= 0 && destination >= 0 else { return }
+        
         var buffer = [UInt8](repeating: 0, count: 8192)
         let bytesRead = read(source, &buffer, buffer.count)
         if bytesRead > 0 {
