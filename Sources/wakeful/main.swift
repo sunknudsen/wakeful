@@ -269,6 +269,10 @@ final class WakefulRunner: @unchecked Sendable {
             let cArgs: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
             execvp(command, cArgs)
             
+            let errorMsg = "Error: failed to execute '\(command)': \(String(cString: strerror(errno)))\n"
+            errorMsg.utf8.withContiguousStorageIfAvailable { buffer in
+                _ = write(STDERR_FILENO, buffer.baseAddress!, buffer.count)
+            }
             Darwin._exit(127)
         }
         
