@@ -93,6 +93,22 @@ enum WakefulError: LocalizedError {
     }
 }
 
+// MARK: - Standard Error Output
+
+private enum StandardError {
+    static func error(_ message: String) {
+        FileHandle.standardError.write(Data("Error: \(message)\n".utf8))
+    }
+    
+    static func warning(_ message: String) {
+        FileHandle.standardError.write(Data("Warning: \(message)\n".utf8))
+    }
+    
+    static func usage(_ text: String) {
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+}
+
 // MARK: - File Descriptor Extensions
 
 extension FileDescriptor {
@@ -153,14 +169,6 @@ private struct TerminalState {
     func restore() {
         guard var termios = original else { return }
         tcsetattr(STDIN_FILENO, TCSANOW, &termios)
-    }
-}
-
-// MARK: - Error Writer
-
-private enum ErrorWriter {
-    static func write(_ message: String) {
-        FileHandle.standardError.write(Data("\(message)\n".utf8))
     }
 }
 
@@ -243,7 +251,7 @@ final class WakefulRunner: @unchecked Sendable {
             )
             
             if displayResult != kIOReturnSuccess {
-                ErrorWriter.write("Warning: Failed to create display sleep assertion")
+                StandardError.warning("Failed to create display sleep assertion")
             }
         }
     }
@@ -261,7 +269,7 @@ final class WakefulRunner: @unchecked Sendable {
         )
         
         guard rootPort != 0, let port = notifierPort else {
-            ErrorWriter.write("Warning: Failed to register for power notifications")
+            StandardError.warning("Failed to register for power notifications")
             return
         }
         
@@ -371,9 +379,10 @@ final class WakefulRunner: @unchecked Sendable {
             let cArgs: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
             execvp(command, cArgs)
             
+            // Note: Can’t use StandardError here as we’re in a forked child process
             let errorMsg = "Error: failed to execute '\(command)': \(String(cString: strerror(errno)))\n"
-            errorMsg.utf8.withContiguousStorageIfAvailable { buffer in
-                _ = write(STDERR_FILENO, buffer.baseAddress!, buffer.count)
+            errorMsg.utf8CString.withUnsafeBufferPointer { buffer in
+                _ = write(STDERR_FILENO, buffer.baseAddress!, buffer.count - 1) // -1 to exclude null terminator
             }
             Darwin._exit(127)
         }
@@ -594,7 +603,7 @@ func parseCommandLine() -> CommandLineOptions? {
             guard let gracePeriodStr = args.first,
                   let gracePeriod = TimeInterval(gracePeriodStr),
                   gracePeriod > 0 else {
-                ErrorWriter.write("Error: -g/--grace-period requires a positive number of seconds")
+                StandardError.error("-g/--grace-period requires a positive number of seconds")
                 return nil
             }
             options.sleepGracePeriod = gracePeriod
@@ -608,7 +617,7 @@ func parseCommandLine() -> CommandLineOptions? {
             exit(0)
             
         default:
-            ErrorWriter.write("Error: Unknown option '\(arg)'")
+            StandardError.error("Unknown option '\(arg)'")
             printUsage()
             exit(1)
         }
@@ -626,7 +635,7 @@ func parseCommandLine() -> CommandLineOptions? {
 }
 
 func printUsage() {
-    FileHandle.standardError.write(Data("""
+    StandardError.usage("""
     Usage: wakeful [options] <command> [arguments...]
     
     Options:
@@ -635,7 +644,7 @@ func printUsage() {
       -v, --verbose                 Verbose output
       -h, --help                    Show this help message
     
-    """.utf8))
+    """)
 }
 
 // MARK: - Main Entry Point
@@ -654,6 +663,6 @@ do {
     let exitCode = try runner.run(command: command, arguments: options.arguments)
     exit(exitCode)
 } catch {
-    ErrorWriter.write("Error: \(error.localizedDescription)")
+    StandardError.error(error.localizedDescription)
     exit(1)
 }
