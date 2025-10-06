@@ -296,9 +296,11 @@ final class WakefulRunner: @unchecked Sendable {
     }
     
     private func handleSystemWillSleep(messageArgument: UnsafeMutableRawPointer?) {
+        // If no child process is running, allow sleep and exit
         guard childPID > 0 else {
             IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
-            return
+            cleanup()
+            exit(0)
         }
         
         if verbose {
@@ -320,6 +322,9 @@ final class WakefulRunner: @unchecked Sendable {
         
         releasePowerAssertions()
         IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
+
+        cleanup()
+        exit(0)
     }
     
     private func waitForChildTermination(semaphore: DispatchSemaphore) {
