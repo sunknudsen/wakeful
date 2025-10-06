@@ -9,9 +9,9 @@ $ swift build
 ## Test
 
 ```console
-$ .build/debug/wakeful ./test.sh
+$ .build/debug/wakeful --verbose ./test.sh
 
-$ .build/debug/wakeful watch ls -la
+$ .build/debug/wakeful --verbose watch ls -la
 ```
 
 ## Release

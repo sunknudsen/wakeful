@@ -4,32 +4,29 @@ import IOKit.pwr_mgt
 
 // MARK: - Constants
 
-private let kIOMessageSystemWillSleep: UInt32 = UInt32(0xE0000280)
-private let kIOMessageSystemHasPoweredOn: UInt32 = UInt32(0xE0000300)
+private enum Constants {
+    static let kIOMessageSystemWillSleep: UInt32 = 0xE0000280
+    static let kIOMessageSystemHasPoweredOn: UInt32 = 0xE0000300
+    static let ioBufferSize = 8192
+    static let drainDelay: useconds_t = 100_000
+    static let terminationTimeout: TimeInterval = 2.0
+}
 
 // MARK: - Type Aliases
 
 private typealias FileDescriptor = Int32
 private typealias SignalNumber = Int32
-private typealias ExitCode = Int32
 
-// MARK: - Wait Status Helpers
+// MARK: - Process Status
 
-/// Decodes the wait status returned by waitpid() into a usable format.
-/// The wait status uses bit fields:
-/// - Bits 0-6: Signal number (if terminated by signal)
-/// - Bits 8-15: Exit code (if exited normally)
 private enum ProcessStatus {
     case exited(code: Int32)
     case signaled(signal: Int32)
     
     init(status: Int32) {
-        // Check if lower 7 bits are 0 (normal exit)
         if (status & 0x7f) == 0 {
-            // Extract exit code from bits 8-15
             self = .exited(code: (status >> 8) & 0xff)
         } else {
-            // Extract signal number from lower 7 bits
             self = .signaled(signal: status & 0x7f)
         }
     }
@@ -39,8 +36,43 @@ private enum ProcessStatus {
         case .exited(let code):
             return code
         case .signaled(let signal):
-            // Shell convention: signal termination returns 128 + signal number
             return 128 + signal
+        }
+    }
+}
+
+// MARK: - Signal Escalation
+
+private enum SignalEscalation {
+    case initial
+    case interrupt
+    case terminate
+    case kill
+    
+    mutating func escalate() {
+        self = switch self {
+        case .initial: .interrupt
+        case .interrupt: .terminate
+        case .terminate, .kill: .kill
+        }
+    }
+    
+    var signal: SignalNumber {
+        switch self {
+        case .initial, .interrupt: SIGINT
+        case .terminate: SIGTERM
+        case .kill: SIGKILL
+        }
+    }
+    
+    var message: String {
+        switch self {
+        case .initial, .interrupt: 
+            "Sending interrupt signal (SIGINT) to child process…"
+        case .terminate: 
+            "Sending termination signal (SIGTERM) to child process…"
+        case .kill: 
+            "Forcefully killing child process (SIGKILL)…"
         }
     }
 }
@@ -61,6 +93,87 @@ enum WakefulError: LocalizedError {
     }
 }
 
+// MARK: - File Descriptor Extensions
+
+extension FileDescriptor {
+    var isValid: Bool { self != -1 }
+    
+    func readData(count: Int) -> Data? {
+        var buffer = [UInt8](repeating: 0, count: count)
+        let bytesRead = read(self, &buffer, count)
+        guard bytesRead > 0 else { return nil }
+        return Data(buffer[..<bytesRead])
+    }
+    
+    @discardableResult
+    func writeData(_ data: Data) -> Bool {
+        data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return false }
+            var totalWritten = 0
+            while totalWritten < data.count {
+                let written = write(self, baseAddress + totalWritten, data.count - totalWritten)
+                if written <= 0 { return false }
+                totalWritten += written
+            }
+            return true
+        }
+    }
+    
+    func setNonBlocking() throws {
+        let flags = fcntl(self, F_GETFL, 0)
+        guard flags != -1 else {
+            throw WakefulError.ptyFailed("Failed to get flags: \(String(cString: strerror(errno)))")
+        }
+        guard fcntl(self, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw WakefulError.ptyFailed("Failed to set non-blocking: \(String(cString: strerror(errno)))")
+        }
+    }
+}
+
+// MARK: - Terminal State
+
+private struct TerminalState {
+    private var original: termios?
+    
+    mutating func enterRawMode() {
+        guard isatty(STDIN_FILENO) != 0 else { return }
+        
+        var termiosStruct = termios()
+        guard tcgetattr(STDIN_FILENO, &termiosStruct) == 0 else { return }
+        
+        original = termiosStruct
+        
+        var raw = termiosStruct
+        cfmakeraw(&raw)
+        raw.c_lflag |= tcflag_t(ISIG)
+        raw.c_lflag &= ~tcflag_t(ECHO)
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw)
+    }
+    
+    func restore() {
+        guard var termios = original else { return }
+        tcsetattr(STDIN_FILENO, TCSANOW, &termios)
+    }
+}
+
+// MARK: - Error Writer
+
+private enum ErrorWriter {
+    static func write(_ message: String) {
+        FileHandle.standardError.write(Data("\(message)\n".utf8))
+    }
+}
+
+// MARK: - Wait Helper
+
+private func waitpidRetrying(_ pid: pid_t, _ status: inout Int32, _ options: Int32) -> Int32 {
+    var result: Int32
+    repeat {
+        result = waitpid(pid, &status, options)
+    } while result == -1 && errno == EINTR
+    return result
+}
+
 // MARK: - WakefulRunner
 
 final class WakefulRunner: @unchecked Sendable {
@@ -76,11 +189,11 @@ final class WakefulRunner: @unchecked Sendable {
     private var notifierPort: IONotificationPortRef?
     private var notifierObject: io_object_t = 0
     private var rootPort: io_connect_t = 0
-    private var signalCount: Int = 0
+    private var signalEscalation: SignalEscalation = .initial
     
     private let processQueue = DispatchQueue(label: "com.wakeful.process")
     private var masterFD: FileDescriptor = -1
-    private var originalTermios: termios?
+    private var terminalState = TerminalState()
     private var stdinSource: DispatchSourceRead?
     private var masterSource: DispatchSourceRead?
     
@@ -130,7 +243,7 @@ final class WakefulRunner: @unchecked Sendable {
             )
             
             if displayResult != kIOReturnSuccess {
-                FileHandle.standardError.write(Data("Warning: Failed to create display sleep assertion\n".utf8))
+                ErrorWriter.write("Warning: Failed to create display sleep assertion")
             }
         }
     }
@@ -148,7 +261,7 @@ final class WakefulRunner: @unchecked Sendable {
         )
         
         guard rootPort != 0, let port = notifierPort else {
-            FileHandle.standardError.write(Data("Warning: Failed to register for power notifications\n".utf8))
+            ErrorWriter.write("Warning: Failed to register for power notifications")
             return
         }
         
@@ -161,10 +274,10 @@ final class WakefulRunner: @unchecked Sendable {
     
     private func handlePowerNotification(messageType: natural_t, messageArgument: UnsafeMutableRawPointer?) {
         switch messageType {
-        case kIOMessageSystemWillSleep:
+        case Constants.kIOMessageSystemWillSleep:
             handleSystemWillSleep(messageArgument: messageArgument)
             
-        case kIOMessageSystemHasPoweredOn:
+        case Constants.kIOMessageSystemHasPoweredOn:
             if verbose {
                 print("\rSystem has woken up\r\n", terminator: "")
             }
@@ -191,32 +304,25 @@ final class WakefulRunner: @unchecked Sendable {
             self?.waitForChildTermination(semaphore: semaphore)
         }
         
-        _ = semaphore.wait(timeout: .now() + sleepGracePeriod + 2.0)
+        _ = semaphore.wait(timeout: .now() + sleepGracePeriod + Constants.terminationTimeout)
         
         if verbose {
             print("\rChild process terminated, allowing sleep…\r\n", terminator: "")
         }
         
-        // Release power assertions before allowing sleep
         releasePowerAssertions()
-        
         IOAllowPowerChange(rootPort, Int(bitPattern: messageArgument))
     }
     
     private func waitForChildTermination(semaphore: DispatchSemaphore) {
         let startTime = Date()
         var status: Int32 = 0
-        var result: Int32
         
-        repeat {
-            result = waitpid(childPID, &status, WNOHANG)
-        } while result == -1 && errno == EINTR
+        var result = waitpidRetrying(childPID, &status, WNOHANG)
         
         while result == 0 && Date().timeIntervalSince(startTime) < sleepGracePeriod {
-            usleep(100_000)
-            repeat {
-                result = waitpid(childPID, &status, WNOHANG)
-            } while result == -1 && errno == EINTR
+            usleep(Constants.drainDelay)
+            result = waitpidRetrying(childPID, &status, WNOHANG)
         }
         
         if result == 0 {
@@ -227,15 +333,11 @@ final class WakefulRunner: @unchecked Sendable {
             kill(-childPID, SIGTERM)
             
             let terminateStartTime = Date()
-            repeat {
-                result = waitpid(childPID, &status, WNOHANG)
-            } while result == -1 && errno == EINTR
+            result = waitpidRetrying(childPID, &status, WNOHANG)
             
-            while result == 0 && Date().timeIntervalSince(terminateStartTime) < 2.0 {
-                usleep(100_000)
-                repeat {
-                    result = waitpid(childPID, &status, WNOHANG)
-                } while result == -1 && errno == EINTR
+            while result == 0 && Date().timeIntervalSince(terminateStartTime) < Constants.terminationTimeout {
+                usleep(Constants.drainDelay)
+                result = waitpidRetrying(childPID, &status, WNOHANG)
             }
         }
         
@@ -259,10 +361,8 @@ final class WakefulRunner: @unchecked Sendable {
         }
         
         if pid == 0 {
-            // Make child process the leader of its own process group
             setpgid(0, 0)
             
-            // Unblock all signals in child process
             var sigset = sigset_t()
             sigemptyset(&sigset)
             sigprocmask(SIG_SETMASK, &sigset, nil)
@@ -281,70 +381,52 @@ final class WakefulRunner: @unchecked Sendable {
         self.childPID = pid
         self.masterFD = master
         
-        try configureTerminal()
+        terminalState.enterRawMode()
+        try masterFD.setNonBlocking()
         setupSignalHandling()
+        
         return try forwardIO()
-    }
-    
-    // MARK: - Terminal Configuration
-    
-    private func configureTerminal() throws {
-        guard isatty(STDIN_FILENO) != 0 else { return }
-        
-        var termiosStruct = termios()
-        guard tcgetattr(STDIN_FILENO, &termiosStruct) == 0 else { return }
-        
-        originalTermios = termiosStruct
-        
-        var raw = termiosStruct
-        cfmakeraw(&raw)
-        raw.c_lflag |= tcflag_t(ISIG)
-        raw.c_lflag &= ~tcflag_t(ECHO)
-        tcsetattr(STDIN_FILENO, TCSANOW, &raw)
     }
     
     // MARK: - Signal Handling
     
     private func setupSignalHandling() {
-        var sigset = sigset_t()
-        sigemptyset(&sigset)
-        sigaddset(&sigset, SIGINT)
-        sigprocmask(SIG_BLOCK, &sigset, nil)
-        
-        signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-        signalSource?.setEventHandler { [weak self] in
+        blockSignal(SIGINT)
+        signalSource = makeSignalSource(for: SIGINT) { [weak self] in
             self?.handleInterrupt()
         }
-        signalSource?.resume()
         
-        sigemptyset(&sigset)
-        sigaddset(&sigset, SIGWINCH)
-        sigprocmask(SIG_BLOCK, &sigset, nil)
-        
-        winchSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .global())
-        winchSource?.setEventHandler { [weak self] in
+        blockSignal(SIGWINCH)
+        winchSource = makeSignalSource(for: SIGWINCH) { [weak self] in
             self?.handleWindowSizeChange()
         }
-        winchSource?.resume()
+    }
+    
+    private func blockSignal(_ signal: SignalNumber) {
+        var sigset = sigset_t()
+        sigemptyset(&sigset)
+        sigaddset(&sigset, signal)
+        sigprocmask(SIG_BLOCK, &sigset, nil)
+    }
+    
+    private func makeSignalSource(for signal: SignalNumber, handler: @escaping () -> Void) -> DispatchSourceSignal {
+        let source = DispatchSource.makeSignalSource(signal: signal, queue: .global())
+        source.setEventHandler(handler: handler)
+        source.resume()
+        return source
     }
     
     private func handleInterrupt() {
-        guard childPID > 0 else {
+        guard childPID > 0, isChildProcessRunning() else {
             cleanup()
             exit(130)
         }
         
-        guard isChildProcessRunning() else {
-            cleanup()
-            exit(130)
-        }
+        signalEscalation.escalate()
+        sendSignalToChildProcessGroup()
         
-        signalCount += 1
-        let signalInfo = determineSignalForInterruptCount()
-        sendSignalToChildProcessGroup(signalInfo)
-        
-        if signalInfo.signal == SIGKILL {
-            usleep(100_000)
+        if signalEscalation.signal == SIGKILL {
+            usleep(Constants.drainDelay)
             cleanup()
             exit(137)
         }
@@ -352,39 +434,23 @@ final class WakefulRunner: @unchecked Sendable {
     
     private func isChildProcessRunning() -> Bool {
         var status: Int32 = 0
-        var result: Int32
-        repeat {
-            result = waitpid(childPID, &status, WNOHANG)
-        } while result == -1 && errno == EINTR
-        return result == 0
+        return waitpidRetrying(childPID, &status, WNOHANG) == 0
     }
     
-    private func determineSignalForInterruptCount() -> (signal: SignalNumber, message: String) {
-        switch signalCount {
-        case 1:
-            return (SIGINT, "Sending interrupt signal (SIGINT) to child process…")
-        case 2:
-            return (SIGTERM, "Sending termination signal (SIGTERM) to child process…")
-        default:
-            return (SIGKILL, "Forcefully killing child process (SIGKILL)…")
-        }
-    }
-    
-    private func sendSignalToChildProcessGroup(_ signalInfo: (signal: SignalNumber, message: String)) {
-        print("\r\(signalInfo.message)\r\n", terminator: "")
-        kill(-childPID, signalInfo.signal)
+    private func sendSignalToChildProcessGroup() {
+        print("\r\(signalEscalation.message)\r\n", terminator: "")
+        kill(-childPID, signalEscalation.signal)
     }
     
     private func handleWindowSizeChange() {
-        guard assertMasterFDValid() else { return }
-        guard isatty(STDIN_FILENO) != 0 else { return }
+        guard masterFD.isValid, isatty(STDIN_FILENO) != 0 else { return }
         
         var windowSize = winsize()
         guard ioctl(STDIN_FILENO, UInt(TIOCGWINSZ), &windowSize) == 0 else { return }
         
         _ = ioctl(masterFD, UInt(TIOCSWINSZ), &windowSize)
         
-        if assertChildProcessValid() {
+        if childPID > 0 {
             kill(childPID, SIGWINCH)
         }
     }
@@ -392,38 +458,14 @@ final class WakefulRunner: @unchecked Sendable {
     // MARK: - I/O Forwarding
     
     private func forwardIO() throws -> Int32 {
-        let flags = fcntl(masterFD, F_GETFL, 0)
-        guard flags != -1 else {
-            throw WakefulError.ptyFailed("Failed to get PTY flags: \(String(cString: strerror(errno)))")
-        }
-        
-        guard fcntl(masterFD, F_SETFL, flags | O_NONBLOCK) != -1 else {
-            throw WakefulError.ptyFailed("Failed to set PTY to non-blocking: \(String(cString: strerror(errno)))")
-        }
-        
         if isatty(STDIN_FILENO) != 0 {
-            stdinSource = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: .global())
-            stdinSource?.setEventHandler { [weak self] in
-                guard let self = self, self.masterFD >= 0 else { return }
-                self.forwardData(from: STDIN_FILENO, to: self.masterFD)
-            }
-            stdinSource?.resume()
+            stdinSource = makeReadSource(from: STDIN_FILENO, to: masterFD)
         }
         
-        masterSource = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
-        masterSource?.setEventHandler { [weak self] in
-            guard let self = self, self.masterFD >= 0 else { return }
-            self.forwardData(from: self.masterFD, to: STDOUT_FILENO)
-        }
-        masterSource?.resume()
+        masterSource = makeReadSource(from: masterFD, to: STDOUT_FILENO)
         
-        // Block SIGCHLD so we can handle it with a dispatch source
-        var sigset = sigset_t()
-        sigemptyset(&sigset)
-        sigaddset(&sigset, SIGCHLD)
-        sigprocmask(SIG_BLOCK, &sigset, nil)
+        blockSignal(SIGCHLD)
         
-        // Set up SIGCHLD handler to detect child termination
         var finalStatus: Int32 = 0
         let childSource = DispatchSource.makeSignalSource(signal: SIGCHLD, queue: .main)
         
@@ -439,70 +481,47 @@ final class WakefulRunner: @unchecked Sendable {
         }
         childSource.resume()
         
-        // Run the main run loop - it will process both:
-        // 1. Power notifications (from IOKit)
-        // 2. SIGCHLD (from dispatch source above)
         CFRunLoopRun()
         
         stdinSource?.cancel()
         masterSource?.cancel()
         
-        // Unblock SIGCHLD after handling
+        var sigset = sigset_t()
         sigemptyset(&sigset)
         sigprocmask(SIG_UNBLOCK, &sigset, nil)
         
-        // Allow remaining PTY data to drain
-        usleep(100_000)
+        usleep(Constants.drainDelay)
         drainRemainingPTYData()
         
         return ProcessStatus(status: finalStatus).exitCode
     }
     
-    private func forwardData(from source: FileDescriptor, to destination: FileDescriptor) {
-        guard source >= 0 && destination >= 0 else { return }
-        
-        var buffer = [UInt8](repeating: 0, count: 8192)
-        let bytesRead = read(source, &buffer, buffer.count)
-        if bytesRead > 0 {
-            var totalWritten: Int = 0
-            buffer.withUnsafeBytes { bufferPtr in
-                while totalWritten < bytesRead {
-                    let written = write(destination, bufferPtr.baseAddress! + totalWritten, bytesRead - totalWritten)
-                    if written <= 0 { break }
-                    totalWritten += written
-                }
-            }
+    private func makeReadSource(from source: FileDescriptor, to destination: FileDescriptor) -> DispatchSourceRead {
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: source, queue: .global())
+        readSource.setEventHandler { [weak self] in
+            self?.forwardData(from: source, to: destination)
         }
+        readSource.resume()
+        return readSource
+    }
+    
+    private func forwardData(from source: FileDescriptor, to destination: FileDescriptor) {
+        guard source.isValid, destination.isValid else { return }
+        guard let data = source.readData(count: Constants.ioBufferSize) else { return }
+        destination.writeData(data)
     }
     
     private func drainRemainingPTYData() {
-        var buffer = [UInt8](repeating: 0, count: 8192)
-        var bytesRead: Int
-        repeat {
-            bytesRead = read(masterFD, &buffer, buffer.count)
-            if bytesRead > 0 {
-                _ = write(STDOUT_FILENO, buffer, bytesRead)
-            }
-        } while bytesRead > 0
-    }
-    
-    // MARK: - State Validation
-    
-    /// Validates that the PTY master file descriptor is open
-    private func assertMasterFDValid() -> Bool {
-        return masterFD != -1
-    }
-    
-    /// Validates that the child process is running
-    private func assertChildProcessValid() -> Bool {
-        return childPID > 0
+        while let data = masterFD.readData(count: Constants.ioBufferSize) {
+            STDOUT_FILENO.writeData(data)
+        }
     }
     
     // MARK: - Cleanup
     
     private func cleanup() {
         cleanupDispatchSources()
-        restoreTerminalState()
+        terminalState.restore()
         closePTY()
         releasePowerAssertions()
         deregisterPowerNotifications()
@@ -522,14 +541,8 @@ final class WakefulRunner: @unchecked Sendable {
         signal(SIGWINCH, SIG_DFL)
     }
     
-    private func restoreTerminalState() {
-        guard let termios = originalTermios else { return }
-        var termiosStruct = termios
-        tcsetattr(STDIN_FILENO, TCSANOW, &termiosStruct)
-    }
-    
     private func closePTY() {
-        guard masterFD != -1 else { return }
+        guard masterFD.isValid else { return }
         close(masterFD)
         masterFD = -1
     }
@@ -581,7 +594,7 @@ func parseCommandLine() -> CommandLineOptions? {
             guard let gracePeriodStr = args.first,
                   let gracePeriod = TimeInterval(gracePeriodStr),
                   gracePeriod > 0 else {
-                FileHandle.standardError.write(Data("Error: -g/--grace-period requires a positive number of seconds\n".utf8))
+                ErrorWriter.write("Error: -g/--grace-period requires a positive number of seconds")
                 return nil
             }
             options.sleepGracePeriod = gracePeriod
@@ -595,7 +608,7 @@ func parseCommandLine() -> CommandLineOptions? {
             exit(0)
             
         default:
-            FileHandle.standardError.write(Data("Error: Unknown option '\(arg)'\n".utf8))
+            ErrorWriter.write("Error: Unknown option '\(arg)'")
             printUsage()
             exit(1)
         }
@@ -641,6 +654,6 @@ do {
     let exitCode = try runner.run(command: command, arguments: options.arguments)
     exit(exitCode)
 } catch {
-    FileHandle.standardError.write(Data("Error: \(error.localizedDescription)\n".utf8))
+    ErrorWriter.write("Error: \(error.localizedDescription)")
     exit(1)
 }
