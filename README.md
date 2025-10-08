@@ -4,15 +4,49 @@
 
 Inspired by `caffeinate`, Wakeful prevents data corruption in long-running processes like [bitcoin-node-docker](https://github.com/sunknudsen/bitcoin-node-docker) by ensuring graceful shutdown before sleep.
 
+If you wish to support this project, please star [repo](https://github.com/sunknudsen/wakeful) and consider a [donation](https://sunknudsen.com/donate).
+
+
 ## Installation
 
+### Build and install Wakeful manually
+
 ```console
+$ git clone https://github.com/sunknudsen/wakeful.git
+
+$ cd wakeful
+
 $ swift build --configuration release
 
 $ sudo cp .build/release/wakeful /usr/local/bin
 ```
 
-## Distribution build (notarized)
+### Build and install Wakeful using [Homebrew](https://brew.sh/)
+
+```console
+$ brew install sunknudsen/tap/wakeful
+```
+
+## Usage
+
+```console
+$ wakeful --help
+Usage: wakeful [options] <command> [arguments...]
+
+Options:
+  -d, --display                 Prevent computer and display from sleeping
+  -g, --grace-period <seconds>  Grace period for child process termination (default: 60)
+  -h, --help                    Show this help message and exit
+  -v, --verbose                 Make operation more talkative
+  -V, --version                 Show version number and exit
+
+Example: wakeful watch ls -la
+
+```
+
+## Distribution
+
+### Build and notarize Wakeful
 
 > **Prerequisites:** 
 > - Create “App Manager” API key on [App Store Connect](https://appstoreconnect.apple.com/access/integrations/api)
@@ -31,21 +65,4 @@ $ ditto -c -k --keepParent .build/release/wakeful wakeful.zip
 $ xcrun notarytool submit wakeful.zip --keychain-profile "wakeful-notarytool" --wait
 
 $ rm wakeful.zip
-```
-
-## Usage
-
-```console
-$ wakeful --help
-Usage: wakeful [options] <command> [arguments...]
-
-Options:
-  -d, --display                 Prevent computer and display from sleeping
-  -g, --grace-period <seconds>  Grace period for child process termination (default: 60)
-  -h, --help                    Show this help message and exit
-  -v, --verbose                 Make operation more talkative
-  -V, --version                 Show version number and exit
-
-Example: wakeful watch ls -la
-
 ```
