@@ -5,6 +5,7 @@ import IOKit.pwr_mgt
 // MARK: - Constants
 
 private enum Constants {
+    static let assertionIdentifier = "com.sunknudsen.wakeful"
     static let kIOMessageSystemWillSleep: UInt32 = 0xE0000280
     static let kIOMessageSystemHasPoweredOn: UInt32 = 0xE0000300
     static let ioBufferSize = 8192
@@ -235,7 +236,7 @@ final class WakefulRunner: @unchecked Sendable {
         let systemResult = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventSystemSleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "Wakeful - Prevent System Sleep" as CFString,
+            "\(Constants.assertionIdentifier).preventsystemsleep" as CFString,
             &assertionID
         )
         
@@ -247,7 +248,7 @@ final class WakefulRunner: @unchecked Sendable {
             let displayResult = IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "Wakeful - Prevent Display Sleep" as CFString,
+                "\(Constants.assertionIdentifier).preventuseridledisplaysleep" as CFString,
                 &displayAssertionID
             )
             
