@@ -11,6 +11,8 @@ private enum Constants {
     static let ioBufferSize = 8192
     static let drainDelay: useconds_t = 100_000
     static let terminationTimeout: TimeInterval = 2.0
+    static let defaultGracePeriod: TimeInterval = 60.0
+    static let version = "1.0.0"
 }
 
 // MARK: - Type Aliases
@@ -620,7 +622,7 @@ final class WakefulRunner: @unchecked Sendable {
 
 struct CommandLineOptions {
     var preventDisplaySleep: Bool = false
-    var sleepGracePeriod: TimeInterval = 60.0
+    var sleepGracePeriod: TimeInterval = Constants.defaultGracePeriod
     var verbose: Bool = false
     var command: String?
     var arguments: [String] = []
@@ -646,12 +648,16 @@ func parseCommandLine() -> CommandLineOptions? {
             }
             options.sleepGracePeriod = gracePeriod
             args.removeFirst()
+
+        case "-h", "--help":
+            printUsage()
+            exit(0)
             
         case "-v", "--verbose":
             options.verbose = true
             
-        case "-h", "--help":
-            printUsage()
+        case "-V", "--version":
+            print("Wakeful \(Constants.version)")
             exit(0)
             
         default:
@@ -677,10 +683,13 @@ func printUsage() {
     Usage: wakeful [options] <command> [arguments...]
     
     Options:
-      -d, --display                 Also prevent display from sleeping
-      -g, --grace-period <seconds>  Grace period for child process termination (default: 60)
-      -v, --verbose                 Verbose output
-      -h, --help                    Show this help message
+      -d, --display                 Prevent computer and display from sleeping
+      -g, --grace-period <seconds>  Grace period for child process termination (default: \(Int(Constants.defaultGracePeriod)))
+      -h, --help                    Show this help message and exit
+      -v, --verbose                 Make operation more talkative
+      -V, --version                 Show version number and exit
+    
+    Example: wakeful watch ls -la
     
     """)
 }
