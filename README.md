@@ -6,7 +6,6 @@ Inspired by `caffeinate`, Wakeful prevents data corruption in long-running proce
 
 If you wish to support this project, please star [repo](https://github.com/sunknudsen/wakeful) and consider a [donation](https://sunknudsen.com/donate).
 
-
 ## Installation
 
 ### Build and install Wakeful manually
