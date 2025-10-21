@@ -12,7 +12,7 @@ private enum Constants {
     static let drainDelay: useconds_t = 100_000
     static let terminationTimeout: TimeInterval = 2.0
     static let defaultGracePeriod: TimeInterval = 60.0
-    static let version = "1.0.0"
+    static let version = "1.1.0"
 }
 
 // MARK: - Type Aliases
