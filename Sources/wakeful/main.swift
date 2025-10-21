@@ -195,9 +195,11 @@ final class WakefulRunner: @unchecked Sendable {
     private let sleepGracePeriod: TimeInterval
     private let verbose: Bool
     
+    private var hupSource: DispatchSourceSignal?
     private var signalSource: DispatchSourceSignal?
     private var termSource: DispatchSourceSignal?
     private var winchSource: DispatchSourceSignal?
+    
     private var notifierPort: IONotificationPortRef?
     private var notifierObject: io_object_t = 0
     private var rootPort: io_connect_t = 0
@@ -409,6 +411,11 @@ final class WakefulRunner: @unchecked Sendable {
     // MARK: - Signal Handling
     
     private func setupSignalHandling() {
+        blockSignal(SIGHUP)
+        hupSource = makeSignalSource(for: SIGHUP) { [weak self] in
+            self?.handleHangup()
+        }
+        
         blockSignal(SIGINT)
         signalSource = makeSignalSource(for: SIGINT) { [weak self] in
             self?.handleInterruption()
@@ -437,6 +444,29 @@ final class WakefulRunner: @unchecked Sendable {
         source.setEventHandler(handler: handler)
         source.resume()
         return source
+    }
+    
+    private func handleHangup() {
+        guard childPID > 0 else {
+            cleanup()
+            exit(129)
+        }
+        
+        if verbose {
+            print("\rReceived hangup signal, sending SIGINT to child process…\r\n", terminator: "")
+        }
+        
+        kill(-childPID, SIGINT)
+        
+        let semaphore = DispatchSemaphore(value: 0)
+        processQueue.async { [weak self] in
+            self?.waitForChildTermination(semaphore: semaphore)
+        }
+        
+        _ = semaphore.wait(timeout: .now() + sleepGracePeriod + Constants.terminationTimeout)
+        
+        cleanup()
+        exit(129)
     }
     
     private func handleInterruption() {
@@ -578,6 +608,8 @@ final class WakefulRunner: @unchecked Sendable {
         stdinSource = nil
         masterSource?.cancel()
         masterSource = nil
+        hupSource?.cancel()
+        hupSource = nil
         signalSource?.cancel()
         signalSource = nil
         termSource?.cancel()
@@ -585,6 +617,7 @@ final class WakefulRunner: @unchecked Sendable {
         winchSource?.cancel()
         winchSource = nil
         
+        signal(SIGHUP, SIG_DFL)
         signal(SIGINT, SIG_DFL)
         signal(SIGTERM, SIG_DFL)
         signal(SIGWINCH, SIG_DFL)
